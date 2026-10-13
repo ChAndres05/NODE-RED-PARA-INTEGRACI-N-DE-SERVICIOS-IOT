@@ -3,38 +3,104 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-#define RST_PIN         4
-#define SS_PIN          5
-#define LED_VERDE       12
-#define LED_ROJO        13
+// ---------- Pines ----------
+#define RST_PIN 4          // RST compartido por los 4 lectores
+#define NUM_LECTORES 4
 
+//                          rfid1    rfid2    rfid4    rfid3
+const char*   NOMBRES[]  = {"norte", "sur",   "este",  "oeste"};
+const uint8_t SS_PINS[]  = {5,       21,      27,      14};
+const uint8_t LED_VERDE[] = {12,     25,      32,      16};
+const uint8_t LED_ROJO[]  = {13,     26,      33,      17};
+
+// ---------- Red ----------
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 const char* mqtt_server = "146.181.17.135";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-MFRC522 mfrc522(SS_PIN, RST_PIN);
 
+MFRC522 lectores[NUM_LECTORES] = {
+  MFRC522(SS_PINS[0], RST_PIN),
+  MFRC522(SS_PINS[1], RST_PIN),
+  MFRC522(SS_PINS[2], RST_PIN),
+  MFRC522(SS_PINS[3], RST_PIN)
+};
+
+// ---------- Estado compartido ----------
+struct EventoRFID {
+  uint8_t idx;
+  char uid[24];
+};
+
+QueueHandle_t colaRFID;
+volatile bool mqttConectado = false;
+volatile int ultimaPuerta = 0;
+
+volatile unsigned long apagarVerdeEn[NUM_LECTORES] = {0};
+volatile unsigned long apagarRojoEn[NUM_LECTORES] = {0};
+unsigned long ultimaLectura[NUM_LECTORES] = {0};
+
+// ---------- Utilidades LEDs ----------
+void encenderVerde(int idx, unsigned long ms) {
+  digitalWrite(LED_VERDE[idx], HIGH);
+  apagarVerdeEn[idx] = millis() + ms;
+}
+
+void encenderRojo(int idx, unsigned long ms) {
+  digitalWrite(LED_ROJO[idx], HIGH);
+  apagarRojoEn[idx] = millis() + ms;
+}
+
+void actualizarLeds() {
+  unsigned long ahora = millis();
+  for (int i = 0; i < NUM_LECTORES; i++) {
+    if (apagarVerdeEn[i] && (long)(ahora - apagarVerdeEn[i]) >= 0) {
+      digitalWrite(LED_VERDE[i], LOW);
+      apagarVerdeEn[i] = 0;
+    }
+    if (apagarRojoEn[i] && (long)(ahora - apagarRojoEn[i]) >= 0) {
+      digitalWrite(LED_ROJO[i], LOW);
+      apagarRojoEn[i] = 0;
+    }
+  }
+}
+
+int buscarPuerta(const String &nombre) {
+  for (int i = 0; i < NUM_LECTORES; i++) {
+    if (nombre.equalsIgnoreCase(NOMBRES[i])) return i;
+  }
+  return -1;
+}
+
+// ---------- MQTT ----------
+// Formatos aceptados: "permitido:sur", "denegado:sur"
+// Si no viene la puerta, se usa la última puerta que escaneó.
 void callback(char* topic, byte* payload, unsigned int length) {
   String mensaje = "";
-  for (int i = 0; i < length; i++) {
-    mensaje += (char)payload[i];
-  }
-  
+  for (unsigned int i = 0; i < length; i++) mensaje += (char)payload[i];
+  mensaje.trim();
+
   Serial.print("[MQTT] Respuesta de Node-RED: ");
   Serial.println(mensaje);
 
-  if (mensaje.startsWith("permitido")) {
-    Serial.println("[ACCESO] Concedido. Abriendo puerta...");
-    digitalWrite(LED_VERDE, HIGH);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    digitalWrite(LED_VERDE, LOW);
+  String estado = mensaje;
+  int idx = ultimaPuerta;
+
+  int sep = mensaje.indexOf(':');
+  if (sep > 0) {
+    estado = mensaje.substring(0, sep);
+    int encontrada = buscarPuerta(mensaje.substring(sep + 1));
+    if (encontrada >= 0) idx = encontrada;
+  }
+
+  if (estado.startsWith("permitido")) {
+    Serial.printf("[ACCESO] Concedido en puerta %s. Abriendo...\n", NOMBRES[idx]);
+    encenderVerde(idx, 3000);
   } else {
-    Serial.println("[ACCESO] Denegado.");
-    digitalWrite(LED_ROJO, HIGH);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    digitalWrite(LED_ROJO, LOW);
+    Serial.printf("[ACCESO] Denegado en puerta %s.\n", NOMBRES[idx]);
+    encenderRojo(idx, 3000);
   }
 }
 
@@ -45,6 +111,7 @@ void TareaMQTT(void *pvParameters) {
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
+      mqttConectado = false;
       Serial.println("[SISTEMA] Conectando a WiFi...");
       WiFi.begin(ssid, password);
       while (WiFi.status() != WL_CONNECTED) {
@@ -54,71 +121,105 @@ void TareaMQTT(void *pvParameters) {
     }
 
     if (!client.connected()) {
+      mqttConectado = false;
       Serial.println("[SISTEMA] Intentando conectar a MQTT...");
       if (client.connect("ESP32_Lector_Norte")) {
         Serial.println("[SISTEMA] Conectado. Activando Modo Online.");
         client.subscribe("esp32/respuesta");
+        mqttConectado = true;
       } else {
         Serial.println("[ALERTA] Conexión perdida. Reintentando en 5s...");
         vTaskDelay(5000 / portTICK_PERIOD_MS);
       }
     } else {
       client.loop();
+
+      // Publicar los eventos que dejó la tarea RFID
+      EventoRFID ev;
+      while (xQueueReceive(colaRFID, &ev, 0) == pdTRUE) {
+        String payload = "{\"puerta\":\"" + String(NOMBRES[ev.idx]) +
+                         "\", \"uid\":\"" + String(ev.uid) + "\"}";
+        client.publish("esp32/rfid", payload.c_str());
+        Serial.println("[MQTT] Datos enviados para validación.");
+      }
     }
 
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
+// ---------- RFID ----------
 void TareaRFID(void *pvParameters) {
   SPI.begin();
-  mfrc522.PCD_Init();
-  Serial.println("[SISTEMA] Lector RFID iniciado. Acerque una tarjeta...");
+
+  // Todos los SS en HIGH antes de iniciar cualquier lector
+  for (int i = 0; i < NUM_LECTORES; i++) {
+    pinMode(SS_PINS[i], OUTPUT);
+    digitalWrite(SS_PINS[i], HIGH);
+  }
+
+  for (int i = 0; i < NUM_LECTORES; i++) {
+    lectores[i].PCD_Init();
+    Serial.printf("[SISTEMA] Lector %s iniciado.\n", NOMBRES[i]);
+  }
+  Serial.println("[SISTEMA] Acerque una tarjeta...");
 
   for (;;) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      String uid = "";
-      for (byte i = 0; i < mfrc522.uid.size; i++) {
-        uid += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
-        uid += String(mfrc522.uid.uidByte[i], HEX);
+    for (int i = 0; i < NUM_LECTORES; i++) {
+      // Enfriamiento de 2 s por lector, sin bloquear a los demás
+      if (millis() - ultimaLectura[i] < 2000) continue;
+
+      if (lectores[i].PICC_IsNewCardPresent() && lectores[i].PICC_ReadCardSerial()) {
+        ultimaLectura[i] = millis();
+
+        String uid = "";
+        for (byte b = 0; b < lectores[i].uid.size; b++) {
+          if (lectores[i].uid.uidByte[b] < 0x10) uid += "0";
+          uid += String(lectores[i].uid.uidByte[b], HEX);
+        }
+        uid.toUpperCase();
+
+        Serial.printf("[RFID] Puerta %s - Tarjeta detectada: %s\n", NOMBRES[i], uid.c_str());
+
+        lectores[i].PICC_HaltA();
+        lectores[i].PCD_StopCrypto1();
+
+        ultimaPuerta = i;
+
+        if (mqttConectado) {
+          EventoRFID ev;
+          ev.idx = i;
+          uid.toCharArray(ev.uid, sizeof(ev.uid));
+          xQueueSend(colaRFID, &ev, 0);
+        } else {
+          Serial.println("[ALERTA] Sin conexión. Acceso denegado temporalmente.");
+          encenderRojo(i, 1000);
+        }
       }
-      uid.toUpperCase();
-      
-      Serial.print("[RFID] Tarjeta detectada: ");
-      Serial.println(uid);
-
-      String payload = "{\"puerta\":\"norte\", \"uid\":\"" + uid + "\"}";
-
-      if (client.connected()) {
-        client.publish("esp32/rfid", payload.c_str());
-        Serial.println("[MQTT] Datos enviados para validación.");
-      } else {
-        Serial.println("[ALERTA] Sin conexión. Acceso denegado temporalmente.");
-        digitalWrite(LED_ROJO, HIGH);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        digitalWrite(LED_ROJO, LOW);
-      }
-
-      vTaskDelay(2000 / portTICK_PERIOD_MS); 
     }
-    
+
+    actualizarLeds();
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-  
-  pinMode(LED_VERDE, OUTPUT);
-  pinMode(LED_ROJO, OUTPUT);
-  
-  digitalWrite(LED_VERDE, LOW);
-  digitalWrite(LED_ROJO, LOW);
 
-  xTaskCreatePinnedToCore(TareaMQTT, "TareaMQTT", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TareaRFID, "TareaRFID", 4096, NULL, 1, NULL, 1);
+  for (int i = 0; i < NUM_LECTORES; i++) {
+    pinMode(LED_VERDE[i], OUTPUT);
+    pinMode(LED_ROJO[i], OUTPUT);
+    digitalWrite(LED_VERDE[i], LOW);
+    digitalWrite(LED_ROJO[i], LOW);
+  }
+
+  colaRFID = xQueueCreate(8, sizeof(EventoRFID));
+
+  xTaskCreatePinnedToCore(TareaMQTT, "TareaMQTT", 6144, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TareaRFID, "TareaRFID", 6144, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  vTaskDelete(NULL); 
+  vTaskDelete(NULL);
 }

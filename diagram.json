@@ -70,6 +70,23 @@
       "left": -209.8,
       "rotate": 270,
       "attrs": { "color": "red" }
+    },
+    { "type": "board-mfrc522", "id": "rfid3", "top": 131.75, "left": -361.36, "attrs": {} },
+    {
+      "type": "wokwi-led",
+      "id": "led7",
+      "top": 316,
+      "left": -200.2,
+      "rotate": 270,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led8",
+      "top": 268,
+      "left": -200.2,
+      "rotate": 270,
+      "attrs": { "color": "limegreen" }
     }
   ],
   "connections": [
@@ -134,7 +151,25 @@
     [ "led5:C", "bb2:38t.e", "cyan", [ "h0" ] ],
     [ "bb2:tn.31", "bb2:38t.d", "cyan", [ "h0" ] ],
     [ "led6:C", "bb2:42t.e", "cyan", [ "h0" ] ],
-    [ "bb2:42t.d", "bb2:tn.34", "cyan", [ "h0" ] ]
+    [ "bb2:42t.d", "bb2:tn.34", "cyan", [ "h0" ] ],
+    [ "rfid3:SDA", "bb2:47t.e", "green", [ "h0" ] ],
+    [ "rfid3:SCK", "bb2:48t.e", "black", [ "h0" ] ],
+    [ "rfid3:MOSI", "bb2:49t.e", "#8f4814", [ "h0" ] ],
+    [ "rfid3:MISO", "bb2:50t.e", "orange", [ "h0" ] ],
+    [ "rfid3:GND", "bb2:tn.42", "cyan", [ "h0" ] ],
+    [ "rfid3:RST", "bb2:53t.e", "red", [ "h0" ] ],
+    [ "rfid3:3.3V", "bb2:tp.44", "green", [ "h441.6" ] ],
+    [ "bb2:26t.d", "bb2:48t.d", "black", [ "h0" ] ],
+    [ "bb2:27t.d", "bb2:49t.d", "#8f4814", [ "h0" ] ],
+    [ "bb2:50t.d", "bb2:28t.d", "orange", [ "h0" ] ],
+    [ "bb2:31t.d", "bb2:53t.d", "red", [ "h0", "v211.2" ] ],
+    [ "led8:A", "bb2:59t.e", "magenta", [ "h0" ] ],
+    [ "led8:C", "bb2:tn.49", "cyan", [ "h0" ] ],
+    [ "led7:A", "bb2:63t.e", "magenta", [ "h0" ] ],
+    [ "led7:C", "bb2:tn.50", "cyan", [ "h0" ] ],
+    [ "esp:14", "bb2:47t.d", "green", [ "v9.6", "h-38.25", "v48" ] ],
+    [ "esp:17", "bb2:63t.a", "magenta", [ "h28.8", "v96" ] ],
+    [ "esp:16", "bb2:59t.a", "magenta", [ "h19.2", "v115.2" ] ]
   ],
   "dependencies": {}
 }
