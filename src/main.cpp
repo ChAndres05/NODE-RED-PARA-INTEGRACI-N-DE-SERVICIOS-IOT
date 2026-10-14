@@ -18,7 +18,7 @@ const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 const char* mqtt_server = "3.133.117.11";
 const char* mqtt_user = "esp32";
-const char* mqtt_pass = "";
+const char* mqtt_pass = "contraseña";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
