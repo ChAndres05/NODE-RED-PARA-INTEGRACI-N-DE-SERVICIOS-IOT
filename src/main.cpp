@@ -4,7 +4,7 @@
 #include <MFRC522.h>
 
 // ---------- Pines ----------
-#define RST_PIN 4          // RST compartido por los 4 lectores
+#define RST_PIN 4         
 #define NUM_LECTORES 4
 
 //                          rfid1    rfid2    rfid4    rfid3
@@ -16,7 +16,9 @@ const uint8_t LED_ROJO[]  = {13,     26,      33,      17};
 // ---------- Red ----------
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
-const char* mqtt_server = "146.181.17.135";
+const char* mqtt_server = "3.133.117.11";
+const char* mqtt_user = "esp32";
+const char* mqtt_pass = "Telematicos2026-1";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -123,18 +125,19 @@ void TareaMQTT(void *pvParameters) {
     if (!client.connected()) {
       mqttConectado = false;
       Serial.println("[SISTEMA] Intentando conectar a MQTT...");
-      if (client.connect("ESP32_Lector_Norte")) {
+      if (client.connect("ESP32_Lector_Norte", mqtt_user, mqtt_pass)) {
         Serial.println("[SISTEMA] Conectado. Activando Modo Online.");
         client.subscribe("esp32/respuesta");
         mqttConectado = true;
       } else {
-        Serial.println("[ALERTA] Conexión perdida. Reintentando en 5s...");
+        
+        Serial.printf("[ALERTA] MQTT fallo, rc=%d. Reintentando en 5s...\n", client.state());
         vTaskDelay(5000 / portTICK_PERIOD_MS);
       }
     } else {
       client.loop();
 
-      // Publicar los eventos que dejó la tarea RFID
+      
       EventoRFID ev;
       while (xQueueReceive(colaRFID, &ev, 0) == pdTRUE) {
         String payload = "{\"puerta\":\"" + String(NOMBRES[ev.idx]) +
@@ -152,7 +155,7 @@ void TareaMQTT(void *pvParameters) {
 void TareaRFID(void *pvParameters) {
   SPI.begin();
 
-  // Todos los SS en HIGH antes de iniciar cualquier lector
+ 
   for (int i = 0; i < NUM_LECTORES; i++) {
     pinMode(SS_PINS[i], OUTPUT);
     digitalWrite(SS_PINS[i], HIGH);
