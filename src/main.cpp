@@ -17,7 +17,7 @@ const char* ssid        = "SAMSUNG";
 const char* password    = "12344321";
 const char* mqtt_server = "3.133.117.11";
 const char* mqtt_user   = "esp32";
-const char* mqtt_pass   = "estoycansado";
+const char* mqtt_pass   = "";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
