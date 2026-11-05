@@ -2,31 +2,38 @@
 #include <PubSubClient.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <Preferences.h>
 
 #define RST_PIN 4
 #define NUM_LECTORES 4
+#define MAX_MAESTRAS 10
+#define MAX_EVENTOS_OFF 30
 
 const char* NOMBRES[]     = {"norte", "sur",   "este",  "oeste"};
 const uint8_t SS_PINS[]   = {5,       21,      27,      14};
 const uint8_t LED_VERDE[] = {15,      25,      32,      16};
 const uint8_t LED_ROJO[]  = {13,      26,      33,      17};
 
+// Tarjeta maestra de fábrica: solo se usa mientras el ESP32 no haya recibido
+// ninguna lista del servidor. Después manda la lista guardada en memoria.
 const char* TARJETA_MAESTRA = "23EECDA6";
 
 const char* ssid        = "SAMSUNG";
 const char* password    = "12344321";
-const char* mqtt_server = "3.133.117.11";
+const char* mqtt_server = "";
 const char* mqtt_user   = "esp32";
 const char* mqtt_pass   = "";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// RST se maneja a mano (un solo reset para todos) para que ningún lector
+// resetee a los demás al inicializarse.
 MFRC522 lectores[NUM_LECTORES] = {
-  MFRC522(SS_PINS[0], RST_PIN),
-  MFRC522(SS_PINS[1], RST_PIN),
-  MFRC522(SS_PINS[2], RST_PIN),
-  MFRC522(SS_PINS[3], RST_PIN)
+  MFRC522(SS_PINS[0], MFRC522::UNUSED_PIN),
+  MFRC522(SS_PINS[1], MFRC522::UNUSED_PIN),
+  MFRC522(SS_PINS[2], MFRC522::UNUSED_PIN),
+  MFRC522(SS_PINS[3], MFRC522::UNUSED_PIN)
 };
 
 TaskHandle_t hTareaOnline  = NULL;
@@ -38,6 +45,116 @@ volatile int ultimaPuerta = 0;
 volatile unsigned long apagarVerdeEn[NUM_LECTORES] = {0};
 volatile unsigned long apagarRojoEn[NUM_LECTORES] = {0};
 unsigned long ultimaLectura[NUM_LECTORES] = {0};
+
+// ---------- Tarjetas maestras (guardadas en memoria flash) ----------
+Preferences prefs;
+String maestras[MAX_MAESTRAS];
+int numMaestras = 0;
+
+// Convierte "UID1,UID2,UID3" en el arreglo en RAM.
+void cargarEnRam(const String &lista) {
+  numMaestras = 0;
+  int inicio = 0;
+  while (inicio <= (int)lista.length() && numMaestras < MAX_MAESTRAS) {
+    int coma = lista.indexOf(',', inicio);
+    if (coma < 0) coma = lista.length();
+    String uid = lista.substring(inicio, coma);
+    uid.trim();
+    if (uid.length() > 0) maestras[numMaestras++] = uid;
+    inicio = coma + 1;
+  }
+}
+
+// Lee la lista guardada en flash al arrancar. Si nunca se guardó una, usa la de fábrica.
+void cargarMaestras() {
+  prefs.begin("acceso", false);
+  String lista = prefs.isKey("maestras") ? prefs.getString("maestras", "") : String(TARJETA_MAESTRA);
+  prefs.end();
+  cargarEnRam(lista);
+  Serial.printf("[MAESTRAS] %d tarjeta(s) en memoria.\n", numMaestras);
+}
+
+// Guarda la lista en flash solo si cambió (evita desgastar la memoria). Devuelve true si hubo cambio.
+bool guardarMaestras(const String &lista) {
+  prefs.begin("acceso", false);
+  bool cambio = !prefs.isKey("maestras") || prefs.getString("maestras", "") != lista;
+  if (cambio) prefs.putString("maestras", lista);
+  prefs.end();
+  return cambio;
+}
+
+// Devuelve true si el UID está en la lista de tarjetas maestras.
+bool esMaestra(const String &uid) {
+  for (int i = 0; i < numMaestras; i++) {
+    if (uid.equalsIgnoreCase(maestras[i])) return true;
+  }
+  return false;
+}
+
+// Procesa el mensaje del servidor con la lista de maestras. Formato: "M:UID1,UID2" ("M:" solo = sin maestras).
+void procesarMaestras(byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+  if (!msg.startsWith("M:")) return;
+
+  String lista = msg.substring(2);
+  lista.trim();
+  lista.toUpperCase();
+
+  bool cambio = guardarMaestras(lista);
+  cargarEnRam(lista);
+  if (cambio) {
+    Serial.printf("[MAESTRAS] Lista actualizada desde el servidor: %d tarjeta(s).\n", numMaestras);
+  }
+}
+
+// ---------- Accesos ocurridos en modo OFFLINE (se envían al volver a ONLINE) ----------
+struct EventoOff {
+  uint8_t puerta;
+  char uid[24];
+  bool concedido;
+  unsigned long ms;   // millis() en el momento del acceso
+};
+
+EventoOff eventosOff[MAX_EVENTOS_OFF];
+int numEventosOff = 0;
+
+// Guarda un acceso hecho sin conexión. Si el buffer se llena, descarta el más antiguo.
+void registrarEventoOffline(int puerta, const String &uid, bool concedido) {
+  if (numEventosOff >= MAX_EVENTOS_OFF) {
+    for (int i = 1; i < MAX_EVENTOS_OFF; i++) eventosOff[i - 1] = eventosOff[i];
+    numEventosOff = MAX_EVENTOS_OFF - 1;
+  }
+  EventoOff &e = eventosOff[numEventosOff++];
+  e.puerta = puerta;
+  uid.toCharArray(e.uid, sizeof(e.uid));
+  e.concedido = concedido;
+  e.ms = millis();
+}
+
+// Envía a Node-RED los accesos guardados. Cada uno lleva "hace_ms" (hace cuánto ocurrió)
+// porque sin conexión el ESP32 no tiene reloj real.
+void enviarEventosOffline() {
+  unsigned long ahora = millis();
+  int enviados = 0;
+
+  for (int i = 0; i < numEventosOff; i++) {
+    String payload = "{\"puerta\":\"" + String(NOMBRES[eventosOff[i].puerta]) +
+                     "\",\"uid\":\"" + String(eventosOff[i].uid) +
+                     "\",\"concedido\":" + (eventosOff[i].concedido ? "true" : "false") +
+                     ",\"hace_ms\":" + String(ahora - eventosOff[i].ms) + "}";
+    if (!client.publish("esp32/offline", payload.c_str())) break;
+    enviados++;
+    client.loop();
+  }
+
+  if (enviados > 0) {
+    for (int i = enviados; i < numEventosOff; i++) eventosOff[i - enviados] = eventosOff[i];
+    numEventosOff -= enviados;
+    Serial.printf("[SYNC] %d acceso(s) offline enviados al servidor.\n", enviados);
+  }
+}
 
 // Enciende el LED verde de la puerta indicada y programa su apagado tras los milisegundos dados.
 void encenderVerde(int idx, unsigned long ms) {
@@ -74,8 +191,13 @@ int buscarPuerta(const String &nombre) {
   return -1;
 }
 
-// Procesa la respuesta MQTT del servidor y enciende el LED verde (permitido) o rojo (denegado) en la puerta correspondiente.
+// Procesa los mensajes MQTT: la lista de maestras (esp32/maestras) o la respuesta del servidor (esp32/respuesta).
 void callback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, "esp32/maestras") == 0) {
+    procesarMaestras(payload, length);
+    return;
+  }
+
   String mensaje = "";
   for (unsigned int i = 0; i < length; i++) mensaje += (char)payload[i];
   mensaje.trim();
@@ -146,7 +268,7 @@ void pasarAOnline() {
   vTaskSuspend(NULL);
 }
 
-// Tarea del modo online: vigila la conexión, atiende MQTT y envía al servidor cada tarjeta leída para que la valide.
+// Tarea del modo online: vigila la conexión, atiende MQTT, sincroniza los accesos offline y envía al servidor cada tarjeta leída para que la valide.
 void TareaOnline(void *pvParameters) {
   vTaskSuspend(NULL);
 
@@ -158,6 +280,8 @@ void TareaOnline(void *pvParameters) {
     }
 
     client.loop();
+
+    if (numEventosOff > 0) enviarEventosOffline();
 
     int idx;
     String uid;
@@ -173,7 +297,7 @@ void TareaOnline(void *pvParameters) {
   }
 }
 
-// Tarea del modo offline: solo acepta la tarjeta maestra e intenta reconectar WiFi y MQTT cada 10 segundos.
+// Tarea del modo offline: solo acepta las tarjetas maestras guardadas, registra cada acceso e intenta reconectar WiFi y MQTT cada 10 segundos.
 void TareaOffline(void *pvParameters) {
   unsigned long ultimoIntento = 0;
 
@@ -181,12 +305,14 @@ void TareaOffline(void *pvParameters) {
     int idx;
     String uid;
     if (leerTarjeta(idx, uid)) {
-      if (uid.equalsIgnoreCase(TARJETA_MAESTRA)) {
+      if (esMaestra(uid)) {
         Serial.printf("[OFFLINE] Tarjeta maestra. Acceso concedido en puerta %s.\n", NOMBRES[idx]);
         encenderVerde(idx, 3000);
+        registrarEventoOffline(idx, uid, true);
       } else {
         Serial.printf("[OFFLINE] Tarjeta no autorizada en puerta %s. Acceso denegado.\n", NOMBRES[idx]);
         encenderRojo(idx, 2000);
+        registrarEventoOffline(idx, uid, false);
       }
     }
 
@@ -201,6 +327,7 @@ void TareaOffline(void *pvParameters) {
           espClient.stop();
           if (client.connect("ESP32_Lector_Norte", mqtt_user, mqtt_pass)) {
             client.subscribe("esp32/respuesta");
+            client.subscribe("esp32/maestras", 1);
             pasarAOnline();
           } else {
             Serial.printf("[CONEXION] MQTT fallo, rc=%d\n", client.state());
@@ -221,6 +348,8 @@ void TareaOffline(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
 
+  cargarMaestras();
+
   for (int i = 0; i < NUM_LECTORES; i++) {
     pinMode(LED_VERDE[i], OUTPUT);
     pinMode(LED_ROJO[i], OUTPUT);
@@ -231,6 +360,14 @@ void setup() {
   }
 
   SPI.begin();
+
+  // Un único reset por hardware para todos los lectores
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW);
+  delay(10);
+  digitalWrite(RST_PIN, HIGH);
+  delay(50);
+
   for (int i = 0; i < NUM_LECTORES; i++) {
     lectores[i].PCD_Init();
     Serial.printf("[SISTEMA] Lector %s iniciado.\n", NOMBRES[i]);
@@ -240,6 +377,7 @@ void setup() {
   client.setCallback(callback);
   client.setKeepAlive(15);
   client.setSocketTimeout(3);
+  client.setBufferSize(512);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -247,7 +385,7 @@ void setup() {
   Serial.println("[SISTEMA] Iniciando en modo OFFLINE hasta conectar con el servidor.");
 
   xTaskCreatePinnedToCore(TareaOffline, "TareaOffline", 6144, NULL, 1, &hTareaOffline, 1);
-  xTaskCreatePinnedToCore(TareaOnline,  "TareaOnline",  6144, NULL, 1, &hTareaOnline,  1);
+  xTaskCreatePinnedToCore(TareaOnline,  "TareaOnline",  8192, NULL, 1, &hTareaOnline,  1);
 }
 
 // No se usa: el trabajo lo hacen las tareas de FreeRTOS, así que este hilo se elimina.
