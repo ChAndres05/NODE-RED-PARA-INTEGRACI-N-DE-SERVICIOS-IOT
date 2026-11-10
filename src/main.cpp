@@ -8,6 +8,7 @@
 #define NUM_LECTORES 4
 #define MAX_MAESTRAS 10
 #define MAX_EVENTOS_OFF 30
+#define T_ESTABILIZAR_MS 8   // tiempo para que el campo de la antena se estabilice antes de leer
 
 const char* NOMBRES[]     = {"norte", "sur",   "este",  "oeste"};
 const uint8_t SS_PINS[]   = {5,       21,      27,      14};
@@ -226,14 +227,19 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// Recorre los lectores buscando una tarjeta nueva; si la encuentra, devuelve su UID en hexadecimal y la puerta donde se leyó.
+// Recorre los lectores de forma SECUENCIAL: enciende la antena de uno, espera a que el campo
+// se estabilice, intenta leer y la apaga antes de pasar al siguiente. Así las antenas vecinas
+// no se interfieren. Si encuentra una tarjeta, devuelve su UID en hexadecimal y la puerta donde se leyó.
 bool leerTarjeta(int &idx, String &uid) {
   for (int i = 0; i < NUM_LECTORES; i++) {
     if (millis() - ultimaLectura[i] < 2000) continue;
 
-    if (lectores[i].PICC_IsNewCardPresent() && lectores[i].PICC_ReadCardSerial()) {
-      ultimaLectura[i] = millis();
+    lectores[i].PCD_AntennaOn();
+    vTaskDelay(pdMS_TO_TICKS(T_ESTABILIZAR_MS));
 
+    bool ok = lectores[i].PICC_IsNewCardPresent() && lectores[i].PICC_ReadCardSerial();
+
+    if (ok) {
       uid = "";
       for (byte b = 0; b < lectores[i].uid.size; b++) {
         if (lectores[i].uid.uidByte[b] < 0x10) uid += "0";
@@ -243,7 +249,12 @@ bool leerTarjeta(int &idx, String &uid) {
 
       lectores[i].PICC_HaltA();
       lectores[i].PCD_StopCrypto1();
+    }
 
+    lectores[i].PCD_AntennaOff();
+
+    if (ok) {
+      ultimaLectura[i] = millis();
       idx = i;
       ultimaPuerta = i;
       Serial.printf("[RFID] Puerta %s - Tarjeta: %s\n", NOMBRES[i], uid.c_str());
@@ -296,7 +307,7 @@ void TareaOnline(void *pvParameters) {
     }
 
     actualizarLeds();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));   // antes 50: el ciclo secuencial ya consume ~45 ms
   }
 }
 
@@ -343,7 +354,7 @@ void TareaOffline(void *pvParameters) {
     }
 
     actualizarLeds();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));   // antes 50: el ciclo secuencial ya consume ~45 ms
   }
 }
 
@@ -377,6 +388,9 @@ void setup() {
     // Ganancia de 33 dB (la de fábrica): con 48 dB el receptor se satura y casi no lee el UID
     byte v = lectores[i].PCD_ReadRegister(MFRC522::VersionReg);
     lectores[i].PCD_SetAntennaGain(MFRC522::RxGain_33dB);
+
+    // Lectura secuencial: todas las antenas apagadas; leerTarjeta() enciende una a la vez
+    lectores[i].PCD_AntennaOff();
 
     Serial.printf("[SISTEMA] Lector %s iniciado (version 0x%02X).\n", NOMBRES[i], v);
   }
