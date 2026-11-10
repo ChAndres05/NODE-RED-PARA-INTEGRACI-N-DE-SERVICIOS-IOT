@@ -41,6 +41,7 @@ TaskHandle_t hTareaOffline = NULL;
 
 volatile bool modoOnline = false;
 volatile int ultimaPuerta = 0;
+volatile unsigned long tUltimoEnvio = 0;   // millis() cuando se mandó la última tarjeta al servidor
 
 volatile unsigned long apagarVerdeEn[NUM_LECTORES] = {0};
 volatile unsigned long apagarRojoEn[NUM_LECTORES] = {0};
@@ -204,6 +205,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   Serial.print("[MQTT] Respuesta de Node-RED: ");
   Serial.println(mensaje);
+  Serial.printf("[LATENCIA] El servidor respondió en %lu ms.\n", millis() - tUltimoEnvio);
 
   String estado = mensaje;
   int idx = ultimaPuerta;
@@ -289,6 +291,7 @@ void TareaOnline(void *pvParameters) {
       String payload = "{\"puerta\":\"" + String(NOMBRES[idx]) +
                        "\", \"uid\":\"" + uid + "\"}";
       client.publish("esp32/rfid", payload.c_str());
+      tUltimoEnvio = millis();
       Serial.println("[MQTT] Datos enviados para validación.");
     }
 
@@ -370,7 +373,12 @@ void setup() {
 
   for (int i = 0; i < NUM_LECTORES; i++) {
     lectores[i].PCD_Init();
-    Serial.printf("[SISTEMA] Lector %s iniciado.\n", NOMBRES[i]);
+
+    // Ganancia de 33 dB (la de fábrica): con 48 dB el receptor se satura y casi no lee el UID
+    byte v = lectores[i].PCD_ReadRegister(MFRC522::VersionReg);
+    lectores[i].PCD_SetAntennaGain(MFRC522::RxGain_33dB);
+
+    Serial.printf("[SISTEMA] Lector %s iniciado (version 0x%02X).\n", NOMBRES[i], v);
   }
 
   client.setServer(mqtt_server, 1883);
@@ -380,6 +388,7 @@ void setup() {
   client.setBufferSize(512);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);   // sin ahorro de energía: las respuestas MQTT llegan más rápido
   WiFi.begin(ssid, password);
 
   Serial.println("[SISTEMA] Iniciando en modo OFFLINE hasta conectar con el servidor.");
